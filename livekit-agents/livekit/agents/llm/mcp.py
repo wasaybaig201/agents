@@ -157,11 +157,22 @@ class MCPServer(ABC):
 
 class MCPServerHTTP(MCPServer):
     """
-    HTTP-based MCP server to detect transport type based on URL path.
+    HTTP-based MCP server with configurable transport type and tool filtering.
 
-    - URLs ending with 'sse' use Server-Sent Events (SSE) transport
-    - URLs ending with 'mcp' use streamable HTTP transport
-    - For other URLs, defaults to SSE transport for backward compatibility
+    Args:
+        url: The URL of the MCP server
+        transport_type: Explicit transport type - "sse" or "streamable_http".
+            If None, transport type is auto-detected from URL path:
+            - URLs ending with 'sse' use Server-Sent Events (SSE) transport
+            - URLs ending with 'mcp' use streamable HTTP transport
+            - For other URLs, defaults to SSE transport for backward compatibility
+        allowed_tools: Optional list of tool names to filter. If provided, only
+            tools whose names are in this list will be available. If None, all
+            tools from the server will be available.
+        headers: Optional HTTP headers to include in requests
+        timeout: Connection timeout in seconds (default: 5)
+        sse_read_timeout: SSE read timeout in seconds (default: 300)
+        client_session_timeout_seconds: Client session timeout in seconds (default: 5)
 
     Note: SSE transport is being deprecated in favor of streamable HTTP transport.
     See: https://github.com/modelcontextprotocol/modelcontextprotocol/pull/206
@@ -170,6 +181,8 @@ class MCPServerHTTP(MCPServer):
     def __init__(
         self,
         url: str,
+        transport_type: str | None = None,
+        allowed_tools: list[str] | None = None,
         headers: dict[str, Any] | None = None,
         timeout: float = 5,
         sse_read_timeout: float = 60 * 5,
@@ -180,18 +193,29 @@ class MCPServerHTTP(MCPServer):
         self.headers = headers
         self._timeout = timeout
         self._sse_read_timeout = sse_read_timeout
-        self._use_streamable_http = self._should_use_streamable_http(url)
+        self._allowed_tools = set(allowed_tools) if allowed_tools else None
+
+        # Determine transport type: explicit > URL-based detection
+        if transport_type is not None:
+            if transport_type not in ("sse", "streamable_http"):
+                raise ValueError(
+                    f"transport_type must be 'sse' or 'streamable_http', got '{transport_type}'"
+                )
+            self._use_streamable_http = transport_type == "streamable_http"
+        else:
+            # Fall back to URL-based detection for backward compatibility
+            self._use_streamable_http = self._should_use_streamable_http(url)
 
     def _should_use_streamable_http(self, url: str) -> bool:
         """
-        Determine transport type based on URL path.
+        Determine transport type based on URL path (for backward compatibility).
 
         Returns True for streamable HTTP if URL ends with 'mcp',
         False for SSE if URL ends with 'sse' or for backward compatibility.
         """
         parsed_url = urlparse(url)
         path_lower = parsed_url.path.lower().rstrip("/")
-        return True
+        return path_lower.endswith("/mcp")
 
     def client_streams(
         self,
@@ -221,43 +245,6 @@ class MCPServerHTTP(MCPServer):
                 sse_read_timeout=self._sse_read_timeout,
             )
 
-    def __repr__(self) -> str:
-        transport_type = "streamable_http" if self._use_streamable_http else "sse"
-        return f"MCPServerHTTP(url={self.url}, transport={transport_type})"
-
-
-class MCPServerHTTPFiltered(MCPServerHTTP):
-    """
-    HTTP-based MCP server with tool filtering capability.
-
-    Only tools whose names are in the `allowed_tools` list will be provided to the agent.
-    If `allowed_tools` is `None` or empty, all tools from the server will be available
-    (same behavior as `MCPServerHTTP`).
-
-    This class extends `MCPServerHTTP` with the same transport detection behavior:
-    - URLs ending with 'sse' use Server-Sent Events (SSE) transport
-    - URLs ending with 'mcp' use streamable HTTP transport
-    - For other URLs, defaults to SSE transport for backward compatibility
-    """
-
-    def __init__(
-        self,
-        url: str,
-        allowed_tools: list[str] | None = None,
-        headers: dict[str, Any] | None = None,
-        timeout: float = 5,
-        sse_read_timeout: float = 60 * 5,
-        client_session_timeout_seconds: float = 5,
-    ) -> None:
-        super().__init__(
-            url=url,
-            headers=headers,
-            timeout=timeout,
-            sse_read_timeout=sse_read_timeout,
-            client_session_timeout_seconds=client_session_timeout_seconds,
-        )
-        self._allowed_tools = set(allowed_tools) if allowed_tools else None
-
     async def list_tools(self) -> list[MCPTool]:
         """
         List tools from the MCP server, filtered by allowed_tools if specified.
@@ -269,16 +256,24 @@ class MCPServerHTTPFiltered(MCPServerHTTP):
             return all_tools
 
         # Filter tools by name
+        return self._filter_tools(all_tools)
+
+    def _filter_tools(self, tools: list[MCPTool]) -> list[MCPTool]:
+        """
+        Filter tools by allowed_tools if specified.
+        """
+        if self._allowed_tools is None:
+            return tools
+
         filtered_tools = []
-        for tool in all_tools:
+        for tool in tools:
             # Get tool name based on tool type
             if is_function_tool(tool):
                 tool_name = get_function_info(tool).name
             elif is_raw_function_tool(tool):
                 tool_name = get_raw_function_info(tool).name
             else:
-                # Fallback: try to get name from raw_schema if available
-                # This shouldn't happen for MCP tools, but handle it gracefully
+                # Fallback: skip tools we can't identify
                 continue
 
             if tool_name in self._allowed_tools:
@@ -293,7 +288,7 @@ class MCPServerHTTPFiltered(MCPServerHTTP):
             if self._allowed_tools
             else ""
         )
-        return f"MCPServerHTTPFiltered(url={self.url}, transport={transport_type}{allowed_str})"
+        return f"MCPServerHTTP(url={self.url}, transport={transport_type}{allowed_str})"
 
 
 class MCPServerStdio(MCPServer):
@@ -325,74 +320,3 @@ class MCPServerStdio(MCPServer):
 
     def __repr__(self) -> str:
         return f"MCPServerStdio(command={self.command}, args={self.args}, cwd={self.cwd})"
-
-
-async def create_mcp_tools(
-    url: str,
-    tool_names: list[str],
-    headers: dict[str, Any] | None = None,
-    timeout: float = 5,
-    sse_read_timeout: float = 60 * 5,
-    client_session_timeout_seconds: float = 5,
-) -> tuple[list[MCPTool], MCPServerHTTPFiltered]:
-    """
-    Create individual MCP tools from an HTTP MCP server that can be attached to agents.
-
-    This function connects to an MCP server, fetches the specified tools, and returns
-    them as a list that can be passed to an Agent's `tools` parameter. The tools are
-    filtered to only include those specified in `tool_names`.
-
-    **Important**: The returned `MCPServerHTTPFiltered` instance must be kept alive
-    for the tools to work. The tools reference the server's client connection internally.
-    You can store the server instance as an attribute of your agent or in a variable
-    that persists for the lifetime of the agent.
-
-    Args:
-        url: The URL of the MCP server (e.g., "http://localhost:8000/mcp")
-        tool_names: List of tool names to fetch from the MCP server
-        headers: Optional HTTP headers to include in requests
-        timeout: Connection timeout in seconds (default: 5)
-        sse_read_timeout: SSE read timeout in seconds (default: 300)
-        client_session_timeout_seconds: Client session timeout in seconds (default: 5)
-
-    Returns:
-        A tuple of (list of tools, MCPServerHTTPFiltered instance).
-        The server instance must be kept alive for the tools to function.
-
-    Example:
-        ```python
-        from livekit.agents import Agent, mcp
-
-        # Create tools from MCP server
-        tools, mcp_server = await mcp.create_mcp_tools(
-            url="http://localhost:8000/mcp",
-            tool_names=["tool1", "tool2"],
-            headers={"Authorization": "Bearer token"}
-        )
-
-        # Create agent with the tools
-        agent = Agent(
-            instructions="You are a helpful assistant",
-            tools=tools  # Tools are attached at agent level
-        )
-
-        # Store the server to keep it alive
-        agent._mcp_server = mcp_server
-        ```
-    """
-    server = MCPServerHTTPFiltered(
-        url=url,
-        allowed_tools=tool_names,
-        headers=headers,
-        timeout=timeout,
-        sse_read_timeout=sse_read_timeout,
-        client_session_timeout_seconds=client_session_timeout_seconds,
-    )
-
-    # Initialize the server connection
-    await server.initialize()
-
-    # Get the filtered tools
-    tools = await server.list_tools()
-
-    return tools, server
